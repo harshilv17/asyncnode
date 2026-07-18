@@ -2,7 +2,7 @@
 
 # Architecture Decision Records (ADR)
 
-This document records major architectural decisions made during the development of AsyncNodes.
+This document records major architectural decisions made during the development of AsyncNode.
 
 Each decision includes:
 
@@ -21,16 +21,15 @@ Use PostgreSQL as the primary persistent datastore.
 
 ## Context
 
-AsyncNodes manages highly related entities:
+AsyncNode manages highly related entities:
 
 * Users
-* Workspaces
-* Workflows
-* Nodes
-* Edges
-* Executions
-* Execution Logs
+* Workflows (with node/edge graphs stored as JSON, see ADR-005)
+* Triggers
 * Integrations
+* Executions
+* Node Executions
+* Execution Logs
 
 The system requires:
 
@@ -315,46 +314,39 @@ Accepted because monitoring is a core product feature.
 
 ---
 
-# ADR-007: Provider-Agnostic AI Layer
+# ADR-007: One Executor Per AI Provider
 
 ## Decision
 
-Abstract AI providers behind a common interface.
+Support OpenAI, Anthropic, and Groq as separate node types, each with its own executor function, rather than building a unified provider abstraction up front.
 
 ## Context
 
-The PRD requires support for:
+The product requires support for:
 
 * OpenAI
 * Anthropic
 * Groq
 
-Users should not be locked into one provider.
-
 ## Alternatives Considered
 
-### Direct Provider Integration in Nodes
+### Unified Provider Interface
 
-Rejected because:
+A shared interface behind which any provider could be swapped was considered, but rejected for the initial implementation because:
 
-* Difficult maintenance
-* Vendor lock-in
-* Repeated logic
+* The three SDKs have different enough request/response shapes that a forced abstraction would leak provider details anyway
+* Premature abstraction would slow down adding the first working version of each
 
 ## Reason Chosen
 
-A provider abstraction enables:
-
-* Easy provider switching
-* Shared guardrails
-* Consistent node behavior
+Three thin executors (`anthropic.executor.ts`, `openai.executor.ts`, `groq.executor.ts`) sharing only the common executor function signature used by the execution engine. This keeps each provider's integration simple and independently changeable.
 
 ## Trade-offs Accepted
 
-* Additional abstraction layer
-* Slightly more development effort
+* No single point to add cross-provider guardrails or fallback logic today
+* Adding a new provider means writing a new executor rather than configuring an existing one
 
-Accepted for long-term flexibility.
+Revisit this decision if/when a real need for provider-agnostic switching (e.g. automatic fallback) emerges.
 
 ---
 
@@ -408,11 +400,11 @@ Accepted because reliability is more important than raw speed.
 
 ---
 
-# ADR-009: Worker-Based Node Execution
+# ADR-009: Queue-Based Node Execution (In-Process Worker)
 
 ## Decision
 
-Execute node logic in dedicated worker processes.
+Route workflow execution through a BullMQ queue and worker rather than running it inline on the request that triggers it, so that AI calls, HTTP requests, and other node logic don't block the API server's request/response cycle.
 
 ## Context
 
@@ -420,31 +412,33 @@ Some nodes may perform:
 
 * AI requests
 * External API calls
-* Heavy processing
-
-API servers should not perform execution work.
+* Long-running operations
 
 ## Alternatives Considered
 
-### Execute Nodes Inside API Server
+### Execute Nodes Synchronously Inside the Request Handler
 
 Rejected because:
 
-* Blocks API requests
-* Poor scalability
-* Higher failure impact
+* Ties execution duration to an HTTP request lifetime
+* One slow node run could tie up an API server thread/connection
+* No retry or crash-recovery story
 
 ## Reason Chosen
 
-Worker isolation provides:
+Queueing the run and consuming it via a BullMQ worker gives:
 
-* Better scalability
-* Independent deployment
-* Improved reliability
+* Decoupling from the triggering request
+* BullMQ's built-in retry/backoff primitives
+* A path to running the worker as a separate process later, without changing the execution engine
+
+## Current State
+
+The worker (`src/workers/WorkflowExecutionWorker.ts`) currently runs in the same Node process as the API server — it is not yet a separately deployed/scaled service. Splitting it out is straightforward (it already only talks to Postgres and Redis) but has not been done.
 
 ## Trade-offs Accepted
 
-* Additional deployment complexity
-* More infrastructure
+* Added Redis/BullMQ dependency for what is currently a single-process deployment
+* Execution status is only as fresh as the last DB write + Socket.IO emit, not truly synchronous
 
-Accepted because execution workloads vary significantly.
+Accepted because decoupling now avoids a harder migration later if/when the worker needs to scale independently.

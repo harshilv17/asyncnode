@@ -1,6 +1,8 @@
 # PRODUCT_BREAKDOWN.md
 
-# AsyncNodes Product Breakdown
+# AsyncNode Product Breakdown
+
+> This document describes the product as currently implemented, plus near-term direction. Anything not reflected in the codebase today is called out explicitly rather than presented as done.
 
 ## Core Users
 
@@ -22,30 +24,30 @@ Build and automate personal workflows without writing custom backend systems.
 ### 2. AI Builders
 
 **Primary Goal:**
-Create AI-powered workflows and multi-agent systems.
+Create AI-powered workflows using one or more AI provider nodes.
 
 **Needs:**
 
-* Use different AI providers (OpenAI, Anthropic, Groq)
-* Chain multiple AI agents together
-* Maintain context between AI steps
-* Enforce structured outputs
-* Apply guardrails and approval flows
+* Use different AI providers (OpenAI, Anthropic, Groq) as workflow nodes
+* Chain AI nodes together in a graph, passing output from one to the next
+* Debug what each node actually received and returned
+
+Note: there is no dedicated "agent" abstraction, shared context object, or structured-output enforcement today — an AI node is a graph node like any other, wired up via edges.
 
 ---
 
 ### 3. Teams & Organizations
 
 **Primary Goal:**
-Automate business processes shared across multiple team members.
+Automate business processes.
 
 **Needs:**
 
-* Shared workflow management
 * Reliable workflow execution
 * Visibility into workflow activity
-* Audit trails and execution history
-* Team collaboration and access control
+* Execution history
+
+Note: there is currently no multi-user workspace, sharing, or role-based access model — each workflow belongs to a single owning user.
 
 ---
 
@@ -101,34 +103,34 @@ Every Day 9 AM
 
 ---
 
-## Workflow 4: Multi-Agent AI Pipeline
+## Workflow 4: Chained AI Nodes
 
-1. User creates AI workflow.
-2. Research agent receives task.
-3. Research output becomes workflow state.
-4. Analysis agent processes research.
-5. Writing agent generates final content.
-6. Output is sent to external service.
-7. Full execution history is recorded.
+1. User creates a workflow with multiple AI nodes in sequence.
+2. First AI node runs and produces output.
+3. That output is passed as input to the next node in the graph.
+4. Final node's output is sent to an external service (e.g. Slack or HTTP).
+5. Full execution history — every node's input/output — is recorded.
 
 Example:
 
-Research Agent
-→ Analysis Agent
-→ Writing Agent
-→ Publish
+AI Node (summarize)
+→ AI Node (classify)
+→ Slack Notification
+
+This is graph-based chaining of individual nodes, not a distinct "multi-agent" runtime.
 
 ---
 
-## Workflow 5: Failure Recovery and Retry
+## Workflow 5: Failure Visibility
 
 1. Workflow execution starts.
 2. Some nodes complete successfully.
-3. Node fails due to API or AI error.
-4. Execution state is preserved.
-5. User inspects failure details.
-6. User retries workflow.
-7. Execution resumes safely.
+3. A node fails due to an API or AI error.
+4. The failure is recorded on that node's `node_execution` row and the execution is marked `failed`.
+5. User inspects the failure via the execution detail view.
+6. User can re-run the workflow manually.
+
+Note: there is no automatic retry or resume-from-failure today — a failed execution must be re-triggered from the start; BullMQ's own job-level retry primitives are available but not currently wired into workflow-level retry logic.
 
 ---
 
@@ -136,186 +138,101 @@ Research Agent
 
 ## 1. Workflow Execution Engine
 
-The platform must execute workflows as real backend processes rather than visual diagrams.
+The platform executes workflows as real backend processes rather than visual diagrams, by resolving the saved graph into a run order and executing nodes against it.
 
-Challenges:
-
-* Dependency resolution
-* Execution ordering
-* Parallel execution
-* State management
-* Long-running workflows
+Current implementation: dependency resolution via topological sort, executed **sequentially** (parallel execution of independent branches is not implemented).
 
 ---
 
-## 2. Durable Execution State
+## 2. Execution State Persistence
 
-Execution progress must survive:
-
-* Server restarts
-* Worker crashes
-* API failures
-* Network interruptions
-
-The system must always know:
-
-* Current node
-* Completed nodes
-* Pending nodes
-* Execution status
+Execution progress is persisted to PostgreSQL as it happens (`execution` and `node_execution` rows), so execution history survives server restarts. There is no automatic resume of an in-flight execution after a crash — a failed/interrupted run must be re-triggered.
 
 ---
 
-## 3. Reliable Data Transfer
+## 3. Data Transfer Between Nodes
 
-Node outputs must move safely between workflow steps.
-
-Challenges:
-
-* Structured data passing
-* Data validation
-* Context propagation
-* Large payload handling
+Node outputs are passed to downstream nodes as JSON along graph edges. There is no schema validation or type enforcement on this data today beyond what each node's executor expects.
 
 ---
 
-## 4. AI Agent Coordination
+## 4. Trigger Management
 
-Multiple AI agents must communicate through workflow state.
-
-Challenges:
-
-* Context sharing
-* Provider abstraction
-* Structured outputs
-* Multi-step reasoning pipelines
-
----
-
-## 5. Trigger Management
-
-Support multiple trigger types:
+Three trigger types are supported:
 
 * Manual triggers
-* Scheduled triggers
-* Webhook triggers
-* External event triggers
+* Scheduled (interval-based) triggers, backed by BullMQ repeatable jobs
+* Webhook triggers, identified by a unique per-trigger token
 
-Challenges:
-
-* Event ingestion
-* Trigger reliability
-* Duplicate prevention
+There is no generic "external event" trigger beyond webhooks, and no built-in duplicate-delivery protection on webhook calls.
 
 ---
 
-## 6. Failure Recovery
+## 5. Failure Visibility
 
-Failures must never cause silent data loss.
+Requirements met today:
 
-Requirements:
+* Preserve execution state on failure (via `node_execution`/`execution` status)
+* Store completed node outputs even if a later node fails
+* Surface errors per node (stored in `node_execution.output_json`)
 
-* Preserve execution state
-* Store completed outputs
-* Provide retry mechanism
-* Surface detailed errors
-
----
-
-## 7. Monitoring and Observability
-
-Users must understand exactly what happened during execution.
-
-Required visibility:
-
-* Execution history
-* Node inputs
-* Node outputs
-* Error messages
-* Execution duration
-* Workflow status
+Not implemented: automatic retry of a failed workflow run.
 
 ---
 
-## 8. Scalability
+## 6. Monitoring and Observability
 
-The architecture should support:
+Available today:
 
-* 100,000+ workflows
-* 100,000+ executions/day
-* 1,000+ concurrent executions
-* Long-running jobs
-* Millions of execution logs
+* Execution history (list + detail endpoints)
+* Node inputs/outputs per run
+* Execution status and timestamps
+* Real-time status via Socket.IO
 
 ---
 
-# Out of Scope (v1)
+## 7. Scalability
 
-The following features will NOT be implemented during the initial sprint cycles:
+No load testing or scale targets have been established yet. The architecture (Postgres + Redis/BullMQ, stateless API layer) is intended to allow horizontal scaling of the API and worker later, but the worker currently runs in-process with the API rather than as an independently scaled deployment.
+
+---
+
+# Not Currently Implemented
+
+These are explicitly out of scope for the current codebase — not planned for the immediate next iteration, and shouldn't be assumed present when integrating or contributing:
 
 ## Integrations
 
-* Hundreds of third-party integrations
-* Public integration marketplace
+Only three node types touch external services today: **Slack**, **email (SMTP)**, and generic **HTTP requests**, plus the three AI providers (OpenAI, Anthropic, Groq). There is no Gmail, Google Sheets, or Telegram integration, and no integration marketplace.
 
-Only a small set of integrations will be supported initially:
+## Workflow Logic
 
-* Slack
-* Gmail
-* Telegram
+No conditional branching, parallel-path routing, or data-transformation node types — the graph is a plain DAG of the five node types (`trigger`, `ai`, `http`, `email`, `slack`).
 
----
+## Collaboration
 
-## Collaboration Features
+No multi-user workspaces, sharing, roles, or permissions. Each workflow belongs to exactly one user.
 
-* Advanced team management
-* Role hierarchies
-* Enterprise permissions
+## Marketplace
 
-Basic ownership and sharing only.
-
----
-
-## Marketplace Features
-
-* Public workflow templates marketplace
-* Public node marketplace
-* Community publishing system
-
----
+No public workflow or node template marketplace.
 
 ## Enterprise Features
 
-* Billing system
-* Subscription management
-* Usage-based pricing
-* Multi-tenant enterprise controls
-
----
+No billing, subscriptions, or multi-tenant controls.
 
 ## Mobile Applications
 
-* Native Android application
-* Native iOS application
+Web only.
 
-Web platform only.
+## Automatic Retry / Resume
 
----
-
-## Advanced AI Features
-
-* Autonomous agent swarms
-* Long-term agent memory systems
-* Agent self-improvement loops
-
-Focus remains on structured workflow-based AI execution.
+No automatic retry of a failed execution or resume of an interrupted one — re-triggering is manual.
 
 ---
 
 # Product Understanding Summary
 
-AsyncNodes is not a diagram editor.
+AsyncNode is not a diagram editor — workflows saved in the builder actually execute as backend jobs, with real state persisted per node and per run.
 
-AsyncNodes is a workflow execution platform that allows users to visually design automation systems while the platform handles execution, reliability, monitoring, integrations, AI orchestration, and failure recovery.
-
-The primary engineering challenge is building a reliable execution engine capable of coordinating thousands of workflow executions at scale.
+It is, today, a single-user, single-process workflow execution platform: one Express API (with an in-process BullMQ worker) backed by Postgres and Redis. The near-term engineering focus is hardening that execution path (retries, parallel branch execution, splitting the worker out) rather than adding new integrations or collaboration features.

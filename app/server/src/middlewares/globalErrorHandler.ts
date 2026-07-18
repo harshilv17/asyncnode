@@ -1,5 +1,6 @@
 import type { thttpError } from "../types/types.js";
 import type { Request, Response, NextFunction } from "express";
+import { ERROR_MESSAGES } from "../constants/messages.ts";
 
 const isHttpError = (err: unknown): err is thttpError => {
     return (
@@ -29,7 +30,7 @@ export const globalErrorHandler = (
     const response: thttpError = {
         success: false,
         status: 500,
-        message: err instanceof Error ? err.message : "Internal server error",
+        message: err instanceof Error ? err.message : ERROR_MESSAGES.INTERNAL_SERVER_ERROR,
         request: {
             ip: req.ip || "",
             method: req.method || "",

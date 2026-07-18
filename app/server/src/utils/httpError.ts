@@ -1,5 +1,6 @@
 import type { thttpError } from "../types/types.js";
 import type { Request, Response, NextFunction } from "express";
+import logger from "./logger.ts";
 
 export const httpError = (
     next:NextFunction,
@@ -23,8 +24,7 @@ export const httpError = (
         trace: trace ?? null,
     };
 
-    //loging
-    console.log(response)
+    logger.error("HTTP Error", response);
 
     return next(response);
 };

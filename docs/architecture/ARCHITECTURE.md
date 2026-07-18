@@ -1,82 +1,73 @@
 # ARCHITECTURE.md
 
-# AsyncNodes Architecture
+# AsyncNode Architecture
 
 ## System Overview
 
-AsyncNodes is an AI-native workflow automation platform that allows users to visually create, execute, monitor, and manage automated workflows.
+AsyncNode is a workflow automation platform. Users design workflows on a node-based canvas; the platform executes them, tracks their state, and streams progress back in real time.
 
-Users design workflows using a node-based canvas while the platform handles execution, scheduling, state management, AI orchestration, integrations, monitoring, and failure recovery. The system is designed to support long-running workflows, external events, and AI-powered automation at scale.
+It is currently a **modular monolith**: a single Express API process that also runs BullMQ workers in-process, backed by PostgreSQL and Redis. There are no separately deployed "scheduler," "webhook," or "worker" services — those are modules/files within the same codebase, described below by responsibility rather than by deployment unit.
 
 ---
 
 # Component Map
 
-## Frontend Application
+## Frontend Application (`app/web`)
 
 **Technology**
 
-* Next.js
-* React
-* TypeScript
-* React Flow
-* Zustand
+* Next.js (App Router)
+* React, TypeScript
+* React Flow (workflow canvas)
+* Socket.IO client
 
 **Responsibilities**
 
-* User authentication
-* Workflow builder UI
-* Node configuration
-* Workflow management
-* Execution monitoring
-* Real-time execution updates
-* Execution history visualization
+* User authentication (signin/signup/verification pages)
+* Workflow builder UI — node canvas, node configuration panels, edge management
+* Workflow list/dashboard
+* Execution monitoring and history display
+* Real-time execution updates via Socket.IO
 
-The frontend never executes workflows. It only manages workflow definitions and displays execution data.
+The frontend never executes workflows. It only manages workflow definitions (graph JSON) and displays execution data pushed from the backend.
+
+State is held in local component state and small custom hooks (`useWorkflow`, `useWorkflows`, `useMe`, `useExecutionSocket`) — there is no global state library.
 
 ---
 
-## API Gateway / Backend API
+## Backend API (`app/server`)
 
 **Technology**
 
-* Node.js
-* Express/Fastify
-* TypeScript
+* Node.js, Express 5, TypeScript
 
 **Responsibilities**
 
-* Authentication & authorization
-* Workflow CRUD operations
-* Trigger management
-* Integration management
-* Execution management
-* Validation
-* Webhook registration
-* Realtime event broadcasting
+* Authentication & authorization (JWT access/refresh tokens in httpOnly cookies)
+* Workflow CRUD and graph persistence
+* Trigger and integration config sync (derived from the saved graph)
+* Triggering executions (manual, webhook, scheduled)
+* Execution/log query endpoints
+* Realtime event broadcasting (via the same process's Socket.IO server)
 
-Acts as the primary entry point for all client requests.
+Organized as modules under `src/modules/` (`auth`, `workflows`, `executions`), each with its own controller/service/repo files.
 
 ---
 
-## Workflow Engine
+## Execution Engine
+
+Implemented in `src/executors/global.executor.ts` plus per-type executors (`http.executor.ts`, `email.executor.ts`, `slack.executor.ts`, `anthropic.executor.ts`, `openai.executor.ts`, `groq.executor.ts`).
 
 **Responsibilities**
 
-* Workflow execution orchestration
-* Dependency resolution
-* Node scheduling
-* State transitions
-* Retry handling
-* Failure recovery
+* Build an executable node/edge list from a workflow's `graphJson` plus its persisted trigger/integration config
+* Resolve execution order via topological sort
+* Run nodes **sequentially** in that order (not parallelized)
+* Persist per-node status/input/output to `node_execution`, and execution-level status to `execution`
+* Emit Socket.IO events as each node starts/succeeds/fails and when the execution finishes
+* Write log lines to `execution_logs`
 
-The workflow engine determines:
-
-* Which node should run
-* When it should run
-* What data should be passed
-
-The workflow engine never directly executes heavy tasks. It schedules them through the queue system.
+Node failures are recorded in `node_execution.output_json` (e.g. `{ error: message }`) rather than a dedicated error column.
 
 ---
 
@@ -84,93 +75,39 @@ The workflow engine never directly executes heavy tasks. It schedules them throu
 
 **Technology**
 
-* BullMQ
-* Redis
+* BullMQ, Redis
 
 **Responsibilities**
 
-* Job scheduling
-* Background execution
-* Retry management
-* Delayed execution
-* Long-running workflow support
+* `WorkflowExecutionQueue` — queues a workflow run (manual, webhook, or scheduled) as a job
+* `VerificationEmailQueue` — queues verification email sends
+* Repeatable jobs (BullMQ job schedulers) back the interval-based scheduling feature (`schedule/start` / `schedule/stop`)
 
-Every node execution becomes a queue job.
-
-Benefits:
-
-* Horizontal scalability
-* Worker isolation
-* Failure tolerance
-* Retry support
+Workers (`src/workers/WorkflowExecutionWorker.ts`, `src/workers/VerificationMailworker.ts`) run in the same Node process as the API server and consume these queues.
 
 ---
 
-## Worker Service
+## Trigger Types
 
-**Responsibilities**
+Three trigger types actually exist, each represented by a row in the `triggers` table:
 
-* Execute node logic
-* Call AI providers
-* Execute integrations
-* Process data transformations
-* Store outputs
+* **Manual** — started via `POST /workflows/:id/run`
+* **Webhook** — a unique `webhookToken` is generated per webhook trigger node; `POST /api/v1/webhooks/:token` looks it up and queues a run
+* **Cron / scheduled** — an interval in seconds (`scheduleIntervalSeconds`) is stored on the workflow; starting the schedule registers a BullMQ repeatable job
 
-Workers consume jobs from BullMQ and execute actual business logic.
-
-Worker instances can scale independently.
+There is no generic "external event" trigger beyond webhooks.
 
 ---
 
-## Scheduler Service
-
-**Responsibilities**
-
-* Scheduled workflow execution
-* Cron processing
-* Recurring automation triggers
-
-Examples:
-
-* Daily reports
-* Weekly summaries
-* Hourly checks
-
-The scheduler creates workflow execution records and sends jobs to the workflow engine.
-
----
-
-## Webhook Service
-
-**Responsibilities**
-
-* Receive external HTTP events
-* Validate incoming requests
-* Identify target workflow
-* Create workflow executions
-
-Example:
-
-External Form
-→ Webhook Endpoint
-→ Workflow Execution
-
----
-
-## Realtime Service
+## Realtime Layer
 
 **Technology**
 
-* Socket.IO
+* Socket.IO (`src/ws/executionSocket.ts` on the server, `hooks/useExecutionSocket.ts` on the client)
 
 **Responsibilities**
 
-* Live execution updates
-* Workflow status updates
-* Node completion notifications
-* Execution log streaming
-
-Allows users to monitor workflows without refreshing the page.
+* Push `execution:started`, `node:running`, `node:success`, `node:failed`, and `execution:finished` events as an execution progresses, so the builder UI can update without polling
 
 ---
 
@@ -178,39 +115,23 @@ Allows users to monitor workflows without refreshing the page.
 
 **Technology**
 
-* PostgreSQL
-* Drizzle ORM
+* PostgreSQL, Drizzle ORM (targets Neon's serverless driver)
 
 **Responsibilities**
 
-* User data
-* Workflow definitions
-* Nodes
-* Edges
-* Execution records
-* Execution logs
-* Trigger configurations
-* Integration configurations
+* Users, workflows, triggers, integrations, executions, node executions, execution logs
 
-The database is the source of truth for all durable state.
+See [`docs/database/DATABASE.md`](../database/DATABASE.md) for the full schema.
 
 ---
 
 ## Redis Layer
 
-**Technology**
-
-* Redis
-
 **Responsibilities**
 
-* Queue storage
-* Temporary execution state
-* Job coordination
-* Rate limiting
-* Cache storage
+* BullMQ queue storage and job coordination
 
-Redis is used for performance and coordination but is not the primary source of truth.
+Redis is not used as a general-purpose cache in this codebase today — its only role is backing BullMQ.
 
 ---
 
@@ -222,31 +143,15 @@ Redis is used for performance and coordination but is not the primary source of 
 * Anthropic
 * Groq
 
-Used by AI nodes and agent workflows.
-
----
+Each is a thin per-provider executor (`anthropic.executor.ts`, `openai.executor.ts`, `groq.executor.ts`) wrapping the respective SDK — there isn't a unified provider abstraction beyond sharing the same executor function signature.
 
 ### Integration Providers
 
-#### Gmail
+* **Slack** — send a message via the `slack` node type (`slack.executor.ts`)
+* **Email (SMTP)** — send via the `email` node type (`email.executor.ts`, Nodemailer), separate from the AI/Slack integrations table
+* **HTTP** — make an arbitrary HTTP request via the `http` node type (`http.executor.ts`)
 
-* Send emails
-* Process incoming emails
-
-#### Google Sheets
-
-* Read records
-* Update records
-
-#### Slack
-
-* Send notifications
-* Receive events
-
-#### Telegram
-
-* Bot automation
-* Message handling
+Gmail, Google Sheets, and Telegram are not implemented.
 
 ---
 
@@ -254,233 +159,41 @@ Used by AI nodes and agent workflows.
 
 ## REST API
 
-Used for:
+```
+Frontend → Backend API → PostgreSQL
+```
+Used for authentication, workflow management, and execution history.
 
-* Authentication
-* Workflow management
-* Execution history
-* Configuration management
+## WebSocket
 
-Pattern:
+```
+Execution engine → Socket.IO → Frontend
+```
+Used for live execution/node status updates.
 
-Frontend
-→ Backend API
-→ Database
+## Job Queue
 
----
-
-## WebSocket Communication
-
-Used for:
-
-* Live execution updates
-* Node status changes
-* Execution progress
-
-Pattern:
-
-Worker
-→ Backend
-→ Socket.IO
-→ Frontend
+```
+Backend API → BullMQ (Redis) → Worker (same process) → Execution engine
+```
+Manual runs, webhook-triggered runs, and scheduled runs all become BullMQ jobs, consumed by an in-process worker.
 
 ---
 
-## Event-Driven Processing
+# Data Flow: Manual Workflow Execution
 
-Used for workflow execution.
-
-Pattern:
-
-Workflow Trigger
-→ Execution Created
-→ Queue Job Created
-→ Worker Executes
-→ Next Job Scheduled
-
-This allows workflows to scale independently from user traffic.
+1. User clicks "Run" in the builder UI → `POST /workflows/:id/run`.
+2. Backend validates ownership, builds the node/edge execution graph from `graphJson` + trigger/integration rows, creates an `execution` row (`status = pending`), and enqueues a BullMQ job.
+3. The in-process worker picks up the job and calls into the execution engine.
+4. The execution engine topologically sorts the nodes and runs them one at a time: each node's executor is invoked, its `node_execution` row is updated, and Socket.IO events (`node:running`, `node:success`/`node:failed`) are emitted.
+5. Execution-level logs are written to `execution_logs`.
+6. Once all nodes have run, the `execution` row is marked `completed` or `failed` and `execution:finished` is emitted.
+7. The frontend, subscribed via Socket.IO, updates the UI live; execution history remains queryable afterward via the `/executions` endpoints.
 
 ---
 
-## Message Queue Communication
-
-BullMQ is used between:
-
-* Workflow Engine
-* Workers
-* Scheduler
-
-Benefits:
-
-* Reliability
-* Retry support
-* Load distribution
-* Long-running workflows
-
----
-
-# Key Decisions
-
-See:
-
-* DECISIONS.md
-
-Major architectural decisions include:
-
-* PostgreSQL as primary datastore
-* Redis + BullMQ for execution orchestration
-* Event-driven workflow execution
-* Node-based workflow architecture
-* Provider-agnostic AI abstraction layer
-* Durable execution state storage
-
----
-
-# Data Flow
-
-## Example: Manual Workflow Execution
-
-### Step 1
-
-User clicks "Execute Workflow".
-
-Frontend sends request:
-
-Frontend
-→ Backend API
-
----
-
-### Step 2
-
-Backend validates:
-
-* User permissions
-* Workflow existence
-* Workflow status
-
-Execution record is created.
-
-Backend
-→ PostgreSQL
-
----
-
-### Step 3
-
-Workflow Engine starts execution.
-
-Workflow Engine
-→ BullMQ
-
-Queue jobs are generated for trigger-ready nodes.
-
----
-
-### Step 4
-
-Worker consumes node job.
-
-BullMQ
-→ Worker
-
-Worker executes node logic.
-
-Examples:
-
-* AI call
-* Slack message
-* Data transformation
-* API request
-
----
-
-### Step 5
-
-Node output is stored.
-
-Worker
-→ PostgreSQL
-
-Execution logs are updated.
-
----
-
-### Step 6
-
-Workflow Engine evaluates graph state.
-
-If downstream nodes are ready:
-
-Workflow Engine
-→ BullMQ
-
-Additional jobs are created.
-
----
-
-### Step 7
-
-Execution progress is streamed.
-
-Worker
-→ Socket.IO
-→ Frontend
-
-User sees live updates.
-
----
-
-### Step 8
-
-Workflow completes.
-
-Execution status becomes:
-
-COMPLETED
-
-Final results remain available in execution history.
-
----
-
-# High-Level Architecture Diagram
-
-User
-↓
-Frontend (Next.js)
-↓
-Backend API
-↓
-PostgreSQL
-
-Backend API
-↓
-Workflow Engine
-↓
-BullMQ Queue
-↓
-Workers
-
-Workers
-↓
-AI Providers / Integrations
-
-Workers
-↓
-PostgreSQL
-
-Workers
-↓
-Socket.IO
-↓
-Frontend
-
-External Events
-↓
-Webhook Service
-↓
-Workflow Engine
-
-Scheduler
-↓
-Workflow Engine
+# Related documents
+
+* [docs/database/DATABASE.md](../database/DATABASE.md) — schema reference
+* [docs/api/API.md](../api/API.md) — REST API reference
+* [docs/decisions/DECISIONS.md](../decisions/DECISIONS.md) — architectural decision records

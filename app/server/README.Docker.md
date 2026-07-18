@@ -1,22 +1,33 @@
-### Building and running your application
+# AsyncNode — Server (Docker)
 
-When you're ready, start your application by running:
-`docker compose up --build`.
+Express API + BullMQ workers for AsyncNode.
 
-Your application will be available at http://localhost:3000.
+See the [root README](../../README.md) for the full project overview.
 
-### Deploying your application to the cloud
+### Building and running with Docker Compose
 
-First, build your image, e.g.: `docker build -t myapp .`.
-If your cloud uses a different CPU architecture than your development
-machine (e.g., you are on a Mac M1 and your cloud provider is amd64),
-you'll want to build the image for that platform, e.g.:
-`docker build --platform=linux/amd64 -t myapp .`.
+From the repo root:
 
-Then, push it to your registry, e.g. `docker push myregistry.com/myapp`.
+```bash
+docker compose -f docker/docker-compose.yml up --build
+```
 
-Consult Docker's [getting started](https://docs.docker.com/go/get-started-sharing/)
-docs for more detail on building and pushing.
+This starts the `server`, `web`, and `redis` services. PostgreSQL is not included — point `DATABASE_URL` at an external instance (e.g. [Neon](https://neon.tech)).
+
+The API is available at [http://localhost:8080](http://localhost:8080) (`PORT` in `.env`). Swagger UI is at `/api/docs`.
+
+### Building the server image standalone
+
+```bash
+docker build -t asyncnode-server .
+```
+
+If your cloud uses a different CPU architecture than your development machine (e.g. Mac M1 vs. amd64), build for that platform:
+
+```bash
+docker build --platform=linux/amd64 -t asyncnode-server .
+```
 
 ### References
+
 * [Docker's Node.js guide](https://docs.docker.com/language/nodejs/)
